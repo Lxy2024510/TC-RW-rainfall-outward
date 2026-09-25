@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Plot nearshore versus open-ocean RW 500-hPa vertical-velocity changes."""
+
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.ticker import FuncFormatter
+
+
+INPUT_CSV = Path(
+    str(PROJECT_ROOT / "Data" / "Processed" / "MSWEP_W500_BOOTSTRAP_RESULTS") + "/" +
+    "W500_REVERSED_1982_2024_MSWEP30_BOOTSTRAP_LONG.csv"
+)
+OUTPUT_DIR = PROJECT_ROOT / "Results" / "Extended_figures" / "EX_FIG6"
+OUTPUT_PNG = OUTPUT_DIR / "EX_FIG6A.png"
+
+RW_GROUP_CODE = "LE_5TH"
+OPEN_OCEAN_CODE = "OPEN_OCEAN"
+NEARSHORE_CODE_CANDIDATES = ("NEARSHORE", "NEAR_COASTAL")
+
+DISTANCE_ZONES = ["0_100", "100_200", "200_300", "300_400", "400_500"]
+DISTANCE_LABELS = [
+    "0\u2013100 km",
+    "100\u2013200 km",
+    "200\u2013300 km",
+    "300\u2013400 km",
+    "400\u2013500 km",
+]
+
+NEARSHORE_COLOR = "#D5A0B6"
+OPEN_OCEAN_COLOR = "#4F9DB8"
+
+FIGURE_SIZE = (6.4, 12.8)
+FIGURE_DPI = 600
+FONT_SIZE = 32
+Y_MIN = -4.9e-1
+Y_MAX = 1.0e-1
+Y_STEP = 1.0e-1
+Y_TICKS = np.array([-4.0, -3.0, -2.0, -1.0, 0.0, 1.0]) * 1.0e-1
+
+
+plt.rcParams.update(
+    {
+        "font.family": "Arial",
+        "font.sans-serif": ["Arial"],
+        "font.cursive": ["Arial"],
+        "mathtext.fontset": "custom",
+        "mathtext.rm": "Arial",
+        "mathtext.it": "Arial:italic",
+        "mathtext.bf": "Arial:bold",
+        "mathtext.cal": "Arial",
+        "font.size": FONT_SIZE,
+        "axes.labelsize": FONT_SIZE,
+        "xtick.labelsize": FONT_SIZE,
+        "ytick.labelsize": FONT_SIZE,
+        "text.color": "#000000",
+        "axes.labelcolor": "#000000",
+        "xtick.color": "#000000",
+        "ytick.color": "#000000",
+    }
+)
+
+
+def read_data() -> tuple[pd.DataFrame, str]:
+    """Read and validate the ten RW records used in FIG6A."""
+    if not INPUT_CSV.is_file():
+        raise FileNotFoundError(f"Input CSV does not exist: {INPUT_CSV}")
+
+    frame = pd.read_csv(INPUT_CSV, low_memory=False)
+    required = {
+        "SPATIAL_TYPE",
+        "INTENSITY_GROUP_CODE",
+        "DISTANCE_ZONE",
+        "MEAN_CHANGE",
+        "BOOTSTRAP_CI_LOWER",
+        "BOOTSTRAP_CI_UPPER",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise KeyError(f"Input CSV is missing columns: {missing}")
+
+    available_types = set(frame["SPATIAL_TYPE"].dropna().astype(str))
+    matched = [code for code in NEARSHORE_CODE_CANDIDATES if code in available_types]
+    if len(matched) != 1:
+        raise ValueError(f"Could not identify one nearshore code: {matched}")
+    nearshore_code = matched[0]
+
+    frame = frame.loc[
+        frame["SPATIAL_TYPE"].isin([nearshore_code, OPEN_OCEAN_CODE])
+        & frame["INTENSITY_GROUP_CODE"].eq(RW_GROUP_CODE)
+        & frame["DISTANCE_ZONE"].isin(DISTANCE_ZONES)
+    ].copy()
+
+    numeric = ["MEAN_CHANGE", "BOOTSTRAP_CI_LOWER", "BOOTSTRAP_CI_UPPER"]
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame[numeric] = frame[numeric].replace([np.inf, -np.inf], np.nan)
+
+    if len(frame) != 2 * len(DISTANCE_ZONES):
+        raise ValueError(f"Expected 10 plotting rows, found {len(frame)}")
+    if frame.duplicated(["SPATIAL_TYPE", "DISTANCE_ZONE"]).any():
+        raise ValueError("Duplicate spatial-type/distance-zone rows were found.")
+    if frame[numeric].isna().any(axis=None):
+        raise ValueError("The selected plotting values are incomplete or invalid.")
+    if (frame["BOOTSTRAP_CI_LOWER"] > frame["BOOTSTRAP_CI_UPPER"]).any():
+        raise ValueError("A bootstrap lower bound exceeds its upper bound.")
+
+    return frame, nearshore_code
+
+
+def ordered_data(frame: pd.DataFrame, spatial_type: str) -> pd.DataFrame:
+    ordered = (
+        frame.loc[frame["SPATIAL_TYPE"].eq(spatial_type)]
+        .set_index("DISTANCE_ZONE")
+        .reindex(DISTANCE_ZONES)
+    )
+    if ordered[["MEAN_CHANGE", "BOOTSTRAP_CI_LOWER", "BOOTSTRAP_CI_UPPER"]].isna().any(axis=None):
+        raise ValueError(f"Incomplete plotting values for {spatial_type}")
+    return ordered
+
+
+def format_scaled_y_tick(value: float, _position: int) -> str:
+    """Format scaled ticks with the proper Unicode minus sign."""
+    scaled = value / 1.0e-1
+    if np.isclose(scaled, 0.0, atol=1.0e-12):
+        return "0"
+    if scaled < 0.0:
+        return f"\N{MINUS SIGN}{abs(scaled):g}"
+    return f"{scaled:g}"
+
+
+def plot_figure(frame: pd.DataFrame, nearshore_code: str) -> None:
+    x = np.arange(len(DISTANCE_ZONES), dtype=float)
+    fig, axis = plt.subplots(figsize=FIGURE_SIZE)
+
+    series = [
+        (nearshore_code, NEARSHORE_COLOR, "o"),
+        (OPEN_OCEAN_CODE, OPEN_OCEAN_COLOR, "o"),
+    ]
+    for spatial_type, color, marker in series:
+        data = ordered_data(frame, spatial_type)
+        mean = data["MEAN_CHANGE"].to_numpy(dtype=float)
+        lower = data["BOOTSTRAP_CI_LOWER"].to_numpy(dtype=float)
+        upper = data["BOOTSTRAP_CI_UPPER"].to_numpy(dtype=float)
+
+        axis.fill_between(x, lower, upper, color=color, alpha=0.18, linewidth=0)
+        axis.plot(
+            x,
+            mean,
+            color=color,
+            linewidth=4.0,
+            marker=marker,
+            markersize=10.0,
+        )
+
+    axis.set_xlim(-0.2, len(x) - 0.8)
+    axis.set_ylim(Y_MIN, Y_MAX)
+    axis.set_yticks(Y_TICKS)
+    axis.yaxis.set_major_formatter(FuncFormatter(format_scaled_y_tick))
+
+    axis.set_axisbelow(True)
+    axis.yaxis.grid(
+        True,
+        color="#C4C4C4",
+        linestyle="--",
+        linewidth=1.2,
+        alpha=0.85,
+    )
+    axis.xaxis.grid(False)
+    axis.axhline(0.0, color="#333333", linestyle="--", linewidth=1.4)
+
+    axis.set_xticks(x)
+    axis.set_xticklabels(
+        DISTANCE_LABELS,
+        rotation=45,
+        ha="right",
+        rotation_mode="anchor",
+    )
+    axis.set_xlabel("")
+    axis.set_ylabel(
+        r"Change in 500-hPa vertical velocity (Pa s$^{-1}$)",
+        labelpad=16,
+    )
+
+    axis.tick_params(
+        axis="x",
+        pad=8,
+        length=10,
+        width=2.0,
+        colors="#000000",
+        direction="out",
+    )
+    axis.tick_params(
+        axis="y",
+        length=10,
+        width=2.0,
+        colors="#000000",
+        direction="out",
+    )
+
+    for spine in axis.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#000000")
+        spine.set_linewidth(2.0)
+
+    # Manual multiplier gives a stable, slightly separated position.
+    axis.text(
+        0.0,
+        1.010,
+        "1e\N{MINUS SIGN}1",
+        transform=axis.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=FONT_SIZE,
+        color="#000000",
+        clip_on=False,
+    )
+
+    fig.subplots_adjust(left=0.13, right=0.98, bottom=0.25, top=0.96)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(OUTPUT_PNG, dpi=FIGURE_DPI, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    print(f"Saved figure: {OUTPUT_PNG}")
+    print("Y-axis: -4.9 to 1 × 10^-1 Pa s^-1; tick interval = 1")
+
+
+def main() -> None:
+    frame, nearshore_code = read_data()
+    plot_figure(frame, nearshore_code)
+
+
+if __name__ == "__main__":
+    main()
