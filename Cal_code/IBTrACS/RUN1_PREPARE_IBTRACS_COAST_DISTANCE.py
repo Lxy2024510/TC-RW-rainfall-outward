@@ -1,0 +1,938 @@
+import os
+import glob
+import warnings
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+from shapely.geometry import Point
+from shapely.ops import nearest_points
+from shapely.prepared import prep
+
+from geopy.distance import distance
+from tqdm import tqdm
+
+
+# ============================================================
+# Project paths
+# ============================================================
+
+# The public repository layout is expected to be:
+# TC-RW-V1/Cal_code/IBTrACS/this_script.py
+# TC-RW-V1/Data/Raw/...
+# TC-RW-V1/Data/Intermediate/...
+# TC-RW-V1/Data/Processed/...
+#
+# TC_RW_PROJECT_ROOT can override the automatically detected project root.
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(
+    os.environ.get(
+        "TC_RW_PROJECT_ROOT",
+        str(DEFAULT_PROJECT_ROOT),
+    )
+).expanduser().resolve()
+
+RAW_DATA_ROOT = PROJECT_ROOT / "Data" / "Raw"
+INTERMEDIATE_ROOT = (
+    PROJECT_ROOT / "Data" / "Intermediate" / "IBTrACS"
+)
+PROCESSED_ROOT = (
+    PROJECT_ROOT / "Data" / "Processed" / "IBTrACS"
+)
+
+SRC_RAW = (
+    RAW_DATA_ROOT
+    / "IBTrACS"
+    / "ibtracs.ALL.list.v04r01.csv"
+)
+
+OUT_SIMPL = (
+    INTERMEDIATE_ROOT
+    / "PRE_DATA_IBT_1982_2024.csv"
+)
+OUT_FINAL = (
+    PROCESSED_ROOT
+    / "PRE_DATA_IBT_1982_2024_CAL_DIST.csv"
+)
+
+GSHHS_SHP = (
+    RAW_DATA_ROOT
+    / "GSHHG"
+    / "gshhg-shp-2.3.7"
+    / "GSHHS_shp"
+    / "f"
+    / "GSHHS_f_L1.shp"
+)
+
+
+# ============================================================
+# Stage 2 workspace
+# ============================================================
+
+WORK_ROOT = str(
+    PROJECT_ROOT
+    / ".work"
+    / "IBTrACS"
+    / "RUN1_COAST_DISTANCE"
+)
+
+TEMP_IN = os.path.join(WORK_ROOT, "TEMP_IN")
+TEMP_OUT = os.path.join(WORK_ROOT, "TEMP_OUT")
+LOG_DIR = os.path.join(WORK_ROOT, "logs")
+
+
+# ============================================================
+# Parameters
+# ============================================================
+
+CHUNK_SIZE = 10000
+MAX_WORKERS = 8
+
+YEAR_START = 1982
+YEAR_END = 2024
+
+# Ignore land polygons with an area smaller than this threshold.
+# The unit depends on the GSHHS shapefile attribute definition.
+MIN_LAND_AREA = 1400
+
+# If True and the simplified file already exists, skip stage 1.
+SKIP_STAGE1_IF_EXISTS = True
+
+# Remove old chunk files before running stage 2.
+CLEAN_OLD_CHUNKS = True
+
+
+# ============================================================
+# Ensure directories exist
+# ============================================================
+
+for path in [
+    os.path.dirname(str(OUT_SIMPL)),
+    os.path.dirname(str(OUT_FINAL)),
+    TEMP_IN,
+    TEMP_OUT,
+    LOG_DIR,
+]:
+    os.makedirs(path, exist_ok=True)
+
+
+# ============================================================
+# General helpers
+# ============================================================
+
+def to_numeric_safe(series):
+    """
+    Convert a Series or scalar to numeric values.
+    Invalid values are converted to NaN.
+    """
+    return pd.to_numeric(series, errors="coerce")
+
+
+def normalize_lon(lon):
+    """
+    Normalize longitude to the interval [-180, 180).
+    """
+    if pd.isna(lon):
+        return np.nan
+
+    lon = float(lon)
+
+    return ((lon + 180.0) % 360.0) - 180.0
+
+
+def count_total_rows(csv_path: str) -> int:
+    """
+    Count data rows in a CSV, excluding its header.
+    """
+    total = 0
+
+    with open(
+        csv_path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+    ) as file:
+        for _ in file:
+            total += 1
+
+    return max(0, total - 1)
+
+
+def validate_input_paths():
+    """
+    Check whether required input files exist.
+    """
+    missing = []
+
+    if not SRC_RAW.exists() and not (
+        SKIP_STAGE1_IF_EXISTS
+        and simplified_file_has_required_columns(OUT_SIMPL)
+    ):
+        missing.append(str(SRC_RAW))
+
+    if not GSHHS_SHP.exists():
+        missing.append(str(GSHHS_SHP))
+
+    if missing:
+        message = "\n".join(f"  - {path}" for path in missing)
+
+        raise FileNotFoundError(
+            "The following required input files do not exist:\n"
+            f"{message}"
+        )
+
+
+def simplified_file_has_required_columns(csv_path):
+    """Return True when the cached simplified file has all required fields."""
+    if not Path(csv_path).exists():
+        return False
+
+    required_columns = {
+        "SID",
+        "ISO_TIME",
+        "USA_LAT",
+        "USA_LON",
+        "USA_RMW",
+        "USA_R34_NE",
+        "USA_R34_SE",
+        "USA_R34_SW",
+        "USA_R34_NW",
+        "USA_R64_NE",
+        "USA_R64_SE",
+        "USA_R64_SW",
+        "USA_R64_NW",
+    }
+
+    try:
+        cached_columns = set(pd.read_csv(csv_path, nrows=0).columns)
+    except Exception:
+        return False
+
+    missing_columns = sorted(required_columns.difference(cached_columns))
+
+    if missing_columns:
+        print(
+            "[Stage 1] Cached simplified file is missing newly required "
+            "columns: " + ", ".join(missing_columns)
+        )
+        return False
+
+    return True
+
+
+def clean_old_chunk_files():
+    """
+    Remove chunk files produced by previous runs.
+
+    This prevents stale output chunks from being included in the
+    newly merged dataset.
+    """
+    patterns = [
+        os.path.join(TEMP_IN, "chunk_*.csv"),
+        os.path.join(TEMP_OUT, "chunk_*_out.csv"),
+        os.path.join(LOG_DIR, "chunk_*.log"),
+    ]
+
+    removed = 0
+
+    for pattern in patterns:
+        for file_path in glob.glob(pattern):
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                removed += 1
+
+    print(f"[Workspace] Removed {removed} old chunk/log files.")
+
+
+# ============================================================
+# Stage 1: Simplify IBTrACS
+# ============================================================
+
+def run_stage1_simplify(src_path: str, out_path: str):
+    """
+    Read the raw IBTrACS CSV, retain required columns, filter by
+    calendar year and keep records at 3-hourly UTC hours.
+    """
+    print("[Stage 1] Simplifying IBTrACS CSV ...")
+
+    # Skip the second row because it contains units.
+    df = pd.read_csv(
+        src_path,
+        header=0,
+        skiprows=[1],
+        low_memory=False,
+    )
+
+    cols_keep = [
+        "SID",
+        "SEASON",
+        "BASIN",
+        "NAME",
+        "ISO_TIME",
+        "DIST2LAND",
+        "STORM_SPEED",
+        "NATURE",
+        "USA_LAT",
+        "USA_LON",
+        "USA_WIND",
+        "USA_SSHS",
+        "USA_RMW",
+        "USA_R34_NE",
+        "USA_R34_SE",
+        "USA_R34_SW",
+        "USA_R34_NW",
+        "USA_R64_NE",
+        "USA_R64_SE",
+        "USA_R64_SW",
+        "USA_R64_NW",
+    ]
+
+    existing_cols = [
+        column for column in cols_keep
+        if column in df.columns
+    ]
+
+    missing_cols = [
+        column for column in cols_keep
+        if column not in df.columns
+    ]
+
+    if missing_cols:
+        print(
+            "[Stage 1] Warning: missing columns in raw IBTrACS: "
+            + ", ".join(missing_cols)
+        )
+
+    required_cols = {
+        "SID",
+        "ISO_TIME",
+        "USA_LAT",
+        "USA_LON",
+        "USA_RMW",
+        "USA_R34_NE",
+        "USA_R34_SE",
+        "USA_R34_SW",
+        "USA_R34_NW",
+        "USA_R64_NE",
+        "USA_R64_SE",
+        "USA_R64_SW",
+        "USA_R64_NW",
+    }
+
+    missing_required = required_cols.difference(df.columns)
+
+    if missing_required:
+        raise KeyError(
+            "Required IBTrACS columns are missing: "
+            + ", ".join(sorted(missing_required))
+        )
+
+    df = df[existing_cols].copy()
+
+    # Convert time column.
+    df["ISO_TIME"] = pd.to_datetime(
+        df["ISO_TIME"],
+        errors="coerce",
+    )
+
+    # Remove invalid timestamps.
+    df = df[df["ISO_TIME"].notna()].copy()
+
+    # Filter by the calendar year of ISO_TIME.
+    df = df[
+        df["ISO_TIME"].dt.year.between(
+            YEAR_START,
+            YEAR_END,
+            inclusive="both",
+        )
+    ].copy()
+
+    # Keep UTC hours at 3-hour intervals.
+    valid_hours = {
+        0,
+        3,
+        6,
+        9,
+        12,
+        15,
+        18,
+        21,
+    }
+
+    df = df[
+        df["ISO_TIME"].dt.hour.isin(valid_hours)
+    ].copy()
+
+    # Remove duplicate storm-time records.
+    before_dedup = len(df)
+
+    df = df.drop_duplicates(
+        subset=["SID", "ISO_TIME"],
+        keep="first",
+    ).copy()
+
+    removed_duplicates = before_dedup - len(df)
+
+    # Convert coordinates to numeric values before saving.
+    df["USA_LAT"] = to_numeric_safe(df["USA_LAT"])
+    df["USA_LON"] = to_numeric_safe(df["USA_LON"])
+    df["USA_RMW"] = to_numeric_safe(df["USA_RMW"])
+    radius_columns = [
+        "USA_R34_NE",
+        "USA_R34_SE",
+        "USA_R34_SW",
+        "USA_R34_NW",
+        "USA_R64_NE",
+        "USA_R64_SE",
+        "USA_R64_SW",
+        "USA_R64_NW",
+    ]
+    for column in radius_columns:
+        df[column] = to_numeric_safe(df[column])
+
+    df.to_csv(
+        out_path,
+        index=False,
+    )
+
+    print(f"Saved simplified file: {out_path}")
+    print(
+        f"Total records: "
+        f"{df.shape[0]} rows x {df.shape[1]} columns"
+    )
+    print(f"Duplicate records removed: {removed_duplicates}")
+    print(df.head())
+
+
+# ============================================================
+# Stage 2: Signed distance to coastline
+# ============================================================
+
+# These objects are initialized separately in every worker process.
+_LAND_GEOM = None
+_LAND_PREPARED = None
+_COAST_BOUNDARY = None
+
+
+def _load_land_and_coastline(shp_path: str):
+    """
+    Load GSHHS level-1 land polygons, retain polygons whose area
+    attribute is at least MIN_LAND_AREA, merge them, and derive
+    the coastline boundary.
+
+    Returns
+    -------
+    land_geom:
+        Unified land polygon geometry.
+
+    coast_boundary:
+        Boundary of the unified land geometry.
+    """
+    gdf = gpd.read_file(shp_path)
+
+    if len(gdf) == 0:
+        raise RuntimeError(
+            "GSHHS shapefile was loaded but contains no features."
+        )
+
+    print(
+        f"[Worker {os.getpid()}] "
+        f"Loaded {len(gdf)} GSHHS polygons."
+    )
+
+    # Coordinates must be longitude/latitude because the TC points
+    # are constructed using USA_LON and USA_LAT.
+    if gdf.crs is None:
+        warnings.warn(
+            "GSHHS shapefile has no CRS metadata. "
+            "Coordinates are assumed to be EPSG:4326."
+        )
+    elif not gdf.crs.is_geographic:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    area_candidates = [
+        column
+        for column in gdf.columns
+        if column.lower() in (
+            "area",
+            "area_km2",
+            "areakm2",
+            "a_km2",
+            "areakm",
+        )
+    ]
+
+    if not area_candidates:
+        raise KeyError(
+            "No supported area attribute was found in the "
+            "GSHHS shapefile. Available columns: "
+            + ", ".join(map(str, gdf.columns))
+        )
+
+    area_col = area_candidates[0]
+
+    gdf[area_col] = pd.to_numeric(
+        gdf[area_col],
+        errors="coerce",
+    )
+
+    before_filter = len(gdf)
+
+    gdf = gdf[
+        gdf[area_col] >= MIN_LAND_AREA
+    ].copy()
+
+    after_filter = len(gdf)
+
+    print(
+        f"[Worker {os.getpid()}] "
+        f"Area column: {area_col}; "
+        f"kept {after_filter}/{before_filter} polygons "
+        f"with {area_col} >= {MIN_LAND_AREA}."
+    )
+
+    if len(gdf) == 0:
+        raise RuntimeError(
+            "No land polygons remain after area filtering. "
+            "Check MIN_LAND_AREA and the GSHHS area attribute."
+        )
+
+    # Repair invalid polygons when possible.
+    invalid_count = (~gdf.geometry.is_valid).sum()
+
+    if invalid_count > 0:
+        print(
+            f"[Worker {os.getpid()}] "
+            f"Repairing {invalid_count} invalid geometries."
+        )
+
+        try:
+            gdf["geometry"] = gdf.geometry.make_valid()
+        except AttributeError:
+            gdf["geometry"] = gdf.geometry.buffer(0)
+
+    gdf = gdf[
+        gdf.geometry.notna()
+        & (~gdf.geometry.is_empty)
+    ].copy()
+
+    try:
+        land_geom = gdf.geometry.union_all()
+    except AttributeError:
+        land_geom = gdf.geometry.unary_union
+
+    if land_geom is None or land_geom.is_empty:
+        raise RuntimeError(
+            "Unified land geometry is empty after union."
+        )
+
+    coast_boundary = land_geom.boundary
+
+    if coast_boundary is None or coast_boundary.is_empty:
+        raise RuntimeError(
+            "Land boundary is empty after polygon union."
+        )
+
+    return land_geom, coast_boundary
+
+
+def _worker_init(shp_path: str):
+    """
+    Load land/coastline geometries once inside each worker.
+    """
+    global _LAND_GEOM
+    global _LAND_PREPARED
+    global _COAST_BOUNDARY
+
+    _LAND_GEOM, _COAST_BOUNDARY = (
+        _load_land_and_coastline(shp_path)
+    )
+
+    # Prepared geometry accelerates repeated covers() checks.
+    _LAND_PREPARED = prep(_LAND_GEOM)
+
+
+def _calc_signed_dist_km(lat, lon):
+    """
+    Calculate signed distance from a TC center to the nearest
+    retained coastline.
+
+    Return convention
+    -----------------
+    negative:
+        TC center is covered by a retained land polygon.
+
+    positive:
+        TC center is outside retained land polygons.
+
+    zero:
+        TC center lies exactly on the coastline.
+
+    NaN:
+        Invalid coordinates or calculation failure.
+    """
+    try:
+        if pd.isna(lat) or pd.isna(lon):
+            return np.nan
+
+        lat = float(lat)
+        lon = normalize_lon(lon)
+
+        if not np.isfinite(lat) or not np.isfinite(lon):
+            return np.nan
+
+        if not (-90.0 <= lat <= 90.0):
+            return np.nan
+
+        point = Point(lon, lat)
+
+        # Find the nearest point on the retained coastline.
+        _, coast_point = nearest_points(
+            point,
+            _COAST_BOUNDARY,
+        )
+
+        # Calculate ellipsoidal geodesic distance in kilometres.
+        dist_km = distance(
+            (point.y, point.x),
+            (coast_point.y, coast_point.x),
+        ).km
+
+        # covers() includes both polygon interiors and boundaries.
+        is_land = _LAND_PREPARED.covers(point)
+
+        if is_land:
+            return -dist_km
+
+        return dist_km
+
+    except Exception:
+        return np.nan
+
+
+def _process_chunk_file(
+    chunk_in_path: str,
+    chunk_out_path: str,
+    log_path: str,
+):
+    """
+    Process one CSV chunk inside a worker process.
+    """
+    df = pd.read_csv(
+        chunk_in_path,
+        low_memory=False,
+    )
+
+    if "USA_LAT" not in df.columns:
+        df["USA_LAT"] = np.nan
+
+    if "USA_LON" not in df.columns:
+        df["USA_LON"] = np.nan
+
+    df["USA_LAT"] = to_numeric_safe(df["USA_LAT"])
+    df["USA_LON"] = to_numeric_safe(df["USA_LON"])
+
+    # Negative = land; positive = ocean.
+    df["CAL_DIST_REAL"] = [
+        _calc_signed_dist_km(lat, lon)
+        for lat, lon in zip(
+            df["USA_LAT"],
+            df["USA_LON"],
+        )
+    ]
+
+    df.to_csv(
+        chunk_out_path,
+        index=False,
+    )
+
+    signed_dist = df["CAL_DIST_REAL"]
+
+    valid = int(signed_dist.notna().sum())
+    land = int((signed_dist < 0).sum())
+    ocean = int((signed_dist > 0).sum())
+    coastline = int((signed_dist == 0).sum())
+    invalid = int(signed_dist.isna().sum())
+
+    with open(
+        log_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(
+            f"rows={len(df)}, "
+            f"valid={valid}, "
+            f"land={land}, "
+            f"ocean={ocean}, "
+            f"coastline={coastline}, "
+            f"invalid={invalid}\n"
+        )
+
+    return {
+        "chunk_out_path": chunk_out_path,
+        "rows": len(df),
+        "valid": valid,
+        "land": land,
+        "ocean": ocean,
+        "coastline": coastline,
+        "invalid": invalid,
+    }
+
+
+def run_stage2_calc_dist(
+    in_csv: str,
+    out_csv: str,
+    shp_path: str,
+):
+    """
+    Calculate signed distance to the retained coastline using
+    chunked, parallel processing.
+    """
+    print(
+        "[Stage 2] Chunked signed coastline-distance "
+        "computation ..."
+    )
+    print(
+        f"[Stage 2] Negative = land; positive = ocean; "
+        f"area threshold = {MIN_LAND_AREA}"
+    )
+
+    if CLEAN_OLD_CHUNKS:
+        clean_old_chunk_files()
+
+    total_rows = count_total_rows(in_csv)
+
+    if total_rows == 0:
+        raise RuntimeError(
+            f"The simplified input CSV has no data rows: {in_csv}"
+        )
+
+    futures = []
+    expected_out_files = []
+
+    global_row_offset = 0
+    chunk_id = 0
+
+    reader = pd.read_csv(
+        in_csv,
+        low_memory=False,
+        chunksize=CHUNK_SIZE,
+    )
+
+    partition_pbar = tqdm(
+        total=total_rows,
+        desc="[Stage 2 | Partition & submit]",
+        unit="rows",
+    )
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_worker_init,
+            initargs=(shp_path,),
+        ) as executor:
+
+            for chunk in reader:
+                if "USA_LAT" not in chunk.columns:
+                    chunk["USA_LAT"] = np.nan
+
+                if "USA_LON" not in chunk.columns:
+                    chunk["USA_LON"] = np.nan
+
+                chunk = chunk.reset_index(drop=True)
+
+                # Preserve exact original row ordering.
+                chunk["ROW_ID"] = (
+                    global_row_offset
+                    + np.arange(
+                        len(chunk),
+                        dtype=np.int64,
+                    )
+                )
+
+                chunk_in = os.path.join(
+                    TEMP_IN,
+                    f"chunk_{chunk_id:06d}.csv",
+                )
+
+                chunk_out = os.path.join(
+                    TEMP_OUT,
+                    f"chunk_{chunk_id:06d}_out.csv",
+                )
+
+                log_path = os.path.join(
+                    LOG_DIR,
+                    f"chunk_{chunk_id:06d}.log",
+                )
+
+                chunk.to_csv(
+                    chunk_in,
+                    index=False,
+                )
+
+                future = executor.submit(
+                    _process_chunk_file,
+                    chunk_in,
+                    chunk_out,
+                    log_path,
+                )
+
+                futures.append(future)
+                expected_out_files.append(chunk_out)
+
+                global_row_offset += len(chunk)
+                chunk_id += 1
+
+                partition_pbar.update(len(chunk))
+
+    finally:
+        partition_pbar.close()
+
+    # Calling future.result() is essential: worker exceptions
+    # will now be propagated instead of being silently ignored.
+    chunk_results = []
+
+    for future in tqdm(
+        as_completed(futures),
+        total=len(futures),
+        desc="[Stage 2 | Computing chunks]",
+    ):
+        result = future.result()
+        chunk_results.append(result)
+
+    missing_outputs = [
+        path
+        for path in expected_out_files
+        if not os.path.exists(path)
+    ]
+
+    if missing_outputs:
+        missing_text = "\n".join(
+            f"  - {path}"
+            for path in missing_outputs
+        )
+
+        raise RuntimeError(
+            "Some expected chunk output files are missing:\n"
+            + missing_text
+        )
+
+    # Use only outputs expected from the current run.
+    # Do not use a broad glob here.
+    dfs = []
+
+    for output_file in tqdm(
+        expected_out_files,
+        desc="[Stage 2 | Reading chunk outputs]",
+    ):
+        dfs.append(
+            pd.read_csv(
+                output_file,
+                low_memory=False,
+            )
+        )
+
+    merged = pd.concat(
+        dfs,
+        axis=0,
+        ignore_index=True,
+    )
+
+    if "ROW_ID" not in merged.columns:
+        raise KeyError(
+            "ROW_ID is missing from processed chunk outputs."
+        )
+
+    merged = (
+        merged
+        .sort_values("ROW_ID")
+        .reset_index(drop=True)
+    )
+
+    if len(merged) != total_rows:
+        raise RuntimeError(
+            "Merged output row count does not match input row count: "
+            f"input={total_rows}, output={len(merged)}"
+        )
+
+    merged = merged.drop(
+        columns=["ROW_ID"],
+        errors="ignore",
+    )
+
+    merged.to_csv(
+        out_csv,
+        index=False,
+    )
+
+    print(f"\nSaved final CSV: {out_csv}")
+
+    signed_dist = merged["CAL_DIST_REAL"]
+
+    valid = int(signed_dist.notna().sum())
+    land = int((signed_dist < 0).sum())
+    ocean = int((signed_dist > 0).sum())
+    coastline = int((signed_dist == 0).sum())
+    invalid = int(signed_dist.isna().sum())
+
+    print(
+        f"[Summary] Valid distance rows: "
+        f"{valid}/{len(merged)} "
+        f"({valid / len(merged):.1%})"
+    )
+    print(f"[Summary] Land rows (< 0): {land}")
+    print(f"[Summary] Ocean rows (> 0): {ocean}")
+    print(
+        f"[Summary] Coastline/zero-distance rows (= 0): "
+        f"{coastline}"
+    )
+    print(f"[Summary] Invalid rows (NaN): {invalid}")
+
+    print(f"\nWorkspace kept at: {WORK_ROOT}")
+    print(
+        "You can remove the workspace after validating "
+        "the final output."
+    )
+
+
+# ============================================================
+# Orchestrator
+# ============================================================
+
+def main():
+    validate_input_paths()
+
+    # Stage 1
+    if (
+        SKIP_STAGE1_IF_EXISTS
+        and simplified_file_has_required_columns(OUT_SIMPL)
+    ):
+        print(
+            "[Stage 1] Skip: simplified file exists -> "
+            f"{OUT_SIMPL}"
+        )
+    else:
+        run_stage1_simplify(
+            str(SRC_RAW),
+            str(OUT_SIMPL),
+        )
+
+    # Stage 2
+    run_stage2_calc_dist(
+        str(OUT_SIMPL),
+        str(OUT_FINAL),
+        str(GSHHS_SHP),
+    )
+
+
+if __name__ == "__main__":
+    main()

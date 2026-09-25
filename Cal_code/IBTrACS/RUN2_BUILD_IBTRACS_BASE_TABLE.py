@@ -1,0 +1,1387 @@
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# 1. Project paths
+# ============================================================
+
+# The public repository layout is expected to be:
+# TC-RW-V1/Cal_code/IBTrACS/this_script.py
+# TC-RW-V1/Data/Processed/IBTrACS/...
+# TC-RW-V1/Results/Quality_control/IBTrACS/...
+#
+# TC_RW_PROJECT_ROOT can override the automatically detected project root.
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(
+    os.environ.get(
+        "TC_RW_PROJECT_ROOT",
+        str(DEFAULT_PROJECT_ROOT),
+    )
+).expanduser().resolve()
+
+PROCESSED_ROOT = (
+    PROJECT_ROOT / "Data" / "Processed" / "IBTrACS"
+)
+QC_ROOT = (
+    PROJECT_ROOT
+    / "Results"
+    / "Quality_control"
+    / "IBTrACS"
+)
+
+INPUT_CSV = (
+    PROCESSED_ROOT
+    / "PRE_DATA_IBT_1982_2024_CAL_DIST.csv"
+)
+
+OUTPUT_CSV = (
+    PROCESSED_ROOT
+    / "PRE_DATA_IBT_1982_2024_BASE.csv"
+)
+
+NON_EXACT_TIME_AUDIT_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_"
+    "BASE_EXCLUDED_NON_EXACT_TIMES.csv"
+)
+
+DUPLICATE_AUDIT_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_"
+    "BASE_DUPLICATE_TIME_RECORDS.csv"
+)
+
+RMW_RECORD_COMPLETENESS_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_BASE_RMW_RECORD_COMPLETENESS.csv"
+)
+
+RMW_ANNUAL_COMPLETENESS_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_BASE_RMW_ANNUAL_COMPLETENESS.csv"
+)
+
+RMW_24H_COMPLETENESS_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_BASE_RMW_24H_COMPLETENESS.csv"
+)
+
+RMW_24H_GROUP_COMPLETENESS_CSV = (
+    QC_ROOT
+    / "PRE_DATA_IBT_1982_2024_BASE_RMW_24H_GROUP_COMPLETENESS.csv"
+)
+
+
+# ============================================================
+# 2. Time parameters
+# ============================================================
+
+VALID_3H_HOURS = {
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+}
+
+NAUTICAL_MILES_PER_DEGREE = 60.04046
+KNOT_TO_MPS = 0.514444
+
+RMW_CHECK_PERIODS = (
+    (1982, 2024),
+    (2001, 2024),
+    (2010, 2024),
+    (2014, 2024),
+    (2020, 2024),
+)
+
+
+# ============================================================
+# 3. Required columns
+# ============================================================
+
+REQUIRED_COLUMNS = {
+    "SID",
+    "ISO_TIME",
+    "USA_LAT",
+    "USA_LON",
+    "USA_WIND",
+    "USA_SSHS",
+    "USA_RMW",
+    "USA_R34_NE",
+    "USA_R34_SE",
+    "USA_R34_SW",
+    "USA_R34_NW",
+    "USA_R64_NE",
+    "USA_R64_SE",
+    "USA_R64_SW",
+    "USA_R64_NW",
+    "CAL_DIST_REAL",
+}
+
+
+# ============================================================
+# 4. General helper functions
+# ============================================================
+
+def validate_required_columns(df):
+    """
+    Check whether all required columns exist.
+    """
+    missing_columns = (
+        REQUIRED_COLUMNS.difference(
+            df.columns
+        )
+    )
+
+    if missing_columns:
+        raise KeyError(
+            "The following required columns are missing: "
+            + ", ".join(
+                sorted(missing_columns)
+            )
+        )
+
+
+def build_rain_time_id(iso_time):
+    """
+    Convert datetime values to YYYYDDD.HH.
+
+    YYYY:
+        Four-digit calendar year.
+
+    DDD:
+        Three-digit day of year.
+
+    HH:
+        Two-digit UTC hour.
+
+    Examples
+    --------
+    1982-01-01 00:00:00 -> 1982001.00
+    1982-02-01 03:00:00 -> 1982032.03
+    1984-12-31 21:00:00 -> 1984366.21
+    """
+    year = iso_time.dt.strftime(
+        "%Y"
+    )
+
+    day_of_year = iso_time.dt.strftime(
+        "%j"
+    )
+
+    hour = iso_time.dt.strftime(
+        "%H"
+    )
+
+    return (
+        year
+        + day_of_year
+        + "."
+        + hour
+    )
+
+
+def rain_time_id_to_datetime(
+    rain_time_id,
+):
+    """
+    Convert YYYYDDD.HH identifiers back to datetime values.
+    """
+    date_part = (
+        rain_time_id
+        .str.slice(0, 7)
+    )
+
+    hour_part = pd.to_numeric(
+        rain_time_id
+        .str.slice(8, 10),
+        errors="coerce",
+    )
+
+    parsed_date = pd.to_datetime(
+        date_part,
+        format="%Y%j",
+        errors="coerce",
+    )
+
+    return (
+        parsed_date
+        + pd.to_timedelta(
+            hour_part,
+            unit="h",
+        )
+    )
+
+
+def write_csv_atomic(
+    df,
+    output_path,
+    date_format=None,
+):
+    """
+    Write a CSV atomically.
+
+    Data are first written to a temporary file in the same
+    directory. The temporary file replaces the formal output only
+    after writing completes successfully.
+    """
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path = (
+        output_path.with_name(
+            output_path.name
+            + f".tmp.{os.getpid()}"
+        )
+    )
+
+    try:
+        df.to_csv(
+            temporary_path,
+            index=False,
+            date_format=date_format,
+        )
+
+        if not temporary_path.exists():
+            raise RuntimeError(
+                "Temporary output was not created: "
+                f"{temporary_path}"
+            )
+
+        if temporary_path.stat().st_size == 0:
+            raise RuntimeError(
+                "Temporary output is empty: "
+                f"{temporary_path}"
+            )
+
+        os.replace(
+            temporary_path,
+            output_path,
+        )
+
+    finally:
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+# ============================================================
+# 5. Read and validate input
+# ============================================================
+
+def read_input_data():
+    """
+    Read the coastline-distance table and validate its structure.
+    """
+    print("=" * 80)
+    print("Step 1: Reading the source CSV")
+    print("=" * 80)
+
+    if not INPUT_CSV.exists():
+        raise FileNotFoundError(
+            f"Input CSV does not exist: {INPUT_CSV}"
+        )
+
+    df = pd.read_csv(
+        INPUT_CSV,
+        dtype={
+            "SID": "string",
+        },
+        low_memory=False,
+    )
+
+    validate_required_columns(
+        df
+    )
+
+    # Preserve the input position for audit purposes only.
+    df["_INPUT_ROW_ID"] = np.arange(
+        len(df),
+        dtype=np.int64,
+    )
+
+    print(f"Input file: {INPUT_CSV}")
+    print(f"Original rows: {len(df)}")
+    print(f"Original columns: {len(df.columns) - 1}")
+
+    return df
+
+
+# ============================================================
+# 6. Convert and validate ISO_TIME
+# ============================================================
+
+def parse_iso_time(df):
+    """
+    Parse ISO_TIME and stop if any timestamp is invalid.
+    """
+    print("\n" + "=" * 80)
+    print("Step 2: Parsing ISO_TIME")
+    print("=" * 80)
+
+    original_iso_time = (
+        df["ISO_TIME"].copy()
+    )
+
+    parsed_iso_time = pd.to_datetime(
+        original_iso_time,
+        errors="coerce",
+    )
+
+    invalid_iso_mask = (
+        parsed_iso_time.isna()
+    )
+
+    invalid_iso_count = int(
+        invalid_iso_mask.sum()
+    )
+
+    if invalid_iso_count > 0:
+        invalid_examples = (
+            df.loc[
+                invalid_iso_mask,
+                [
+                    "_INPUT_ROW_ID",
+                    "SID",
+                    "ISO_TIME",
+                ],
+            ]
+            .head(20)
+            .to_dict("records")
+        )
+
+        raise ValueError(
+            f"Found {invalid_iso_count} missing or invalid "
+            f"ISO_TIME values. Examples: {invalid_examples}"
+        )
+
+    df = df.copy()
+    df["ISO_TIME"] = parsed_iso_time
+
+    print(
+        f"ISO_TIME parsing passed: "
+        f"{len(df)} valid timestamps."
+    )
+
+    return df
+
+
+# ============================================================
+# 7. Identify strict 3-hourly records
+# ============================================================
+
+def build_strict_3hour_mask(df):
+    """
+    Return a mask for exact 3-hourly timestamps.
+
+    A valid timestamp must satisfy all of the following:
+
+    - Hour is one of 00, 03, 06, 09, 12, 15, 18, or 21.
+    - Minute is zero.
+    - Second is zero.
+    - Microsecond is zero.
+    """
+    return (
+        df["ISO_TIME"]
+        .dt.hour
+        .isin(
+            VALID_3H_HOURS
+        )
+        & (
+            df["ISO_TIME"]
+            .dt.minute
+            == 0
+        )
+        & (
+            df["ISO_TIME"]
+            .dt.second
+            == 0
+        )
+        & (
+            df["ISO_TIME"]
+            .dt.microsecond
+            == 0
+        )
+    )
+
+
+def audit_non_exact_times(
+    df,
+    strict_3hour_mask,
+):
+    """
+    Save every record that does not occur at an exact 3-hourly
+    timestamp.
+    """
+    print("\n" + "=" * 80)
+    print("Step 3: Auditing exact 3-hourly timestamps")
+    print("=" * 80)
+
+    non_exact_mask = (
+        ~strict_3hour_mask
+    )
+
+    non_exact_count = int(
+        non_exact_mask.sum()
+    )
+
+    audit_columns = [
+        "_INPUT_ROW_ID",
+        "SID",
+        "NAME",
+        "ISO_TIME",
+        "USA_LAT",
+        "USA_LON",
+        "USA_SSHS",
+        "CAL_DIST_REAL",
+    ]
+
+    audit_columns = [
+        column
+        for column in audit_columns
+        if column in df.columns
+    ]
+
+    audit_df = (
+        df.loc[
+            non_exact_mask,
+            audit_columns,
+        ]
+        .copy()
+    )
+
+    if not audit_df.empty:
+        audit_df[
+            "HOUR"
+        ] = (
+            audit_df[
+                "ISO_TIME"
+            ].dt.hour
+        )
+
+        audit_df[
+            "MINUTE"
+        ] = (
+            audit_df[
+                "ISO_TIME"
+            ].dt.minute
+        )
+
+        audit_df[
+            "SECOND"
+        ] = (
+            audit_df[
+                "ISO_TIME"
+            ].dt.second
+        )
+
+        audit_df[
+            "EXCLUSION_REASON"
+        ] = (
+            "NOT_EXACT_3_HOURLY_TIME"
+        )
+
+    write_csv_atomic(
+        audit_df,
+        NON_EXACT_TIME_AUDIT_CSV,
+        date_format="%Y-%m-%d %H:%M:%S",
+    )
+
+    print(
+        f"Exact 3-hourly records: "
+        f"{int(strict_3hour_mask.sum())}"
+    )
+
+    print(
+        f"Non-exact records identified: "
+        f"{non_exact_count}"
+    )
+
+    print(
+        f"Non-exact-time audit: "
+        f"{NON_EXACT_TIME_AUDIT_CSV}"
+    )
+
+    return non_exact_count
+
+
+# ============================================================
+# 8. Convert numeric columns
+# ============================================================
+
+def convert_numeric_columns(df):
+    """Convert required IBTrACS measurement fields to numeric values."""
+    numeric_columns = [
+        "USA_LAT",
+        "USA_LON",
+        "USA_WIND",
+        "USA_SSHS",
+        "USA_RMW",
+        "USA_R34_NE",
+        "USA_R34_SE",
+        "USA_R34_SW",
+        "USA_R34_NW",
+        "USA_R64_NE",
+        "USA_R64_SE",
+        "USA_R64_SW",
+        "USA_R64_NW",
+    ]
+
+    df = df.copy()
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df[numeric_columns] = (
+        df[numeric_columns]
+        .replace(
+            [
+                np.inf,
+                -np.inf,
+            ],
+            np.nan,
+        )
+    )
+
+    return df
+
+
+# ============================================================
+# 9. Filter records
+# ============================================================
+
+def filter_records(
+    df,
+    strict_3hour_mask,
+):
+    """
+    Apply coordinate, USA_SSHS, and exact-time filters.
+    """
+    print("\n" + "=" * 80)
+    print("Step 4: Filtering records")
+    print("=" * 80)
+
+    missing_coordinate_mask = (
+        df["USA_LAT"].isna()
+        | df["USA_LON"].isna()
+    )
+
+    invalid_sshs_mask = (
+        df["USA_SSHS"].isna()
+        | (
+            df["USA_SSHS"]
+            < -1
+        )
+    )
+
+    non_exact_time_mask = (
+        ~strict_3hour_mask
+    )
+
+    valid_mask = (
+        ~missing_coordinate_mask
+        & ~invalid_sshs_mask
+        & ~non_exact_time_mask
+    )
+
+    missing_coordinate_count = int(
+        missing_coordinate_mask.sum()
+    )
+
+    invalid_sshs_count = int(
+        invalid_sshs_mask.sum()
+    )
+
+    non_exact_time_count = int(
+        non_exact_time_mask.sum()
+    )
+
+    # Count non-exact records that would otherwise survive all
+    # coordinate and intensity filters.
+    time_only_removal_count = int(
+        (
+            non_exact_time_mask
+            & ~missing_coordinate_mask
+            & ~invalid_sshs_mask
+        ).sum()
+    )
+
+    filtered = df.loc[
+        valid_mask
+    ].copy()
+
+    filtered = filtered.reset_index(
+        drop=True
+    )
+
+    print(
+        "Rows with missing or invalid coordinates: "
+        f"{missing_coordinate_count}"
+    )
+
+    print(
+        "Rows with missing USA_SSHS or USA_SSHS < -1: "
+        f"{invalid_sshs_count}"
+    )
+
+    print(
+        "Rows with non-exact 3-hourly timestamps: "
+        f"{non_exact_time_count}"
+    )
+
+    print(
+        "Rows removed only because of the strict time filter: "
+        f"{time_only_removal_count}"
+    )
+
+    print(
+        f"Rows retained after all filters: "
+        f"{len(filtered)}"
+    )
+
+    return (
+        filtered,
+        {
+            "missing_coordinate_count": (
+                missing_coordinate_count
+            ),
+            "invalid_sshs_count": (
+                invalid_sshs_count
+            ),
+            "non_exact_time_count": (
+                non_exact_time_count
+            ),
+            "time_only_removal_count": (
+                time_only_removal_count
+            ),
+        },
+    )
+
+
+# ============================================================
+# 10. Validate unique storm-time records
+# ============================================================
+
+def validate_unique_storm_times(
+    filtered,
+):
+    """
+    Verify that every SID and ISO_TIME pair is unique.
+    """
+    duplicate_mask = (
+        filtered.duplicated(
+            subset=[
+                "SID",
+                "ISO_TIME",
+            ],
+            keep=False,
+        )
+    )
+
+    duplicate_count = int(
+        duplicate_mask.sum()
+    )
+
+    if duplicate_count > 0:
+        duplicate_columns = [
+            "_INPUT_ROW_ID",
+            "SID",
+            "NAME",
+            "ISO_TIME",
+            "USA_LAT",
+            "USA_LON",
+            "USA_SSHS",
+        ]
+
+        duplicate_columns = [
+            column
+            for column in duplicate_columns
+            if column in filtered.columns
+        ]
+
+        duplicate_df = (
+            filtered.loc[
+                duplicate_mask,
+                duplicate_columns,
+            ]
+            .sort_values(
+                [
+                    "SID",
+                    "ISO_TIME",
+                    "_INPUT_ROW_ID",
+                ]
+            )
+        )
+
+        write_csv_atomic(
+            duplicate_df,
+            DUPLICATE_AUDIT_CSV,
+            date_format="%Y-%m-%d %H:%M:%S",
+        )
+
+        raise ValueError(
+            "Duplicate (SID, ISO_TIME) records remain after "
+            f"strict time filtering. Count: {duplicate_count}. "
+            f"Audit file: {DUPLICATE_AUDIT_CSV}"
+        )
+
+    print(
+        "[PASS] Every (SID, ISO_TIME) key is unique."
+    )
+
+
+# ============================================================
+# 11. Generate and validate RAIN_TIME_ID
+# ============================================================
+
+def generate_and_validate_rain_time_id(
+    filtered,
+):
+    """
+    Generate RAIN_TIME_ID and validate format, uniqueness, and
+    round-trip time consistency.
+    """
+    print("\n" + "=" * 80)
+    print("Step 5: Generating and validating RAIN_TIME_ID")
+    print("=" * 80)
+
+    filtered = filtered.copy()
+
+    filtered[
+        "RAIN_TIME_ID"
+    ] = build_rain_time_id(
+        filtered["ISO_TIME"]
+    )
+
+    rain_id_format_mask = (
+        filtered[
+            "RAIN_TIME_ID"
+        ]
+        .str.fullmatch(
+            r"\d{7}\.\d{2}",
+            na=False,
+        )
+    )
+
+    invalid_format_count = int(
+        (~rain_id_format_mask).sum()
+    )
+
+    if invalid_format_count > 0:
+        examples = (
+            filtered.loc[
+                ~rain_id_format_mask,
+                [
+                    "_INPUT_ROW_ID",
+                    "SID",
+                    "ISO_TIME",
+                    "RAIN_TIME_ID",
+                ],
+            ]
+            .head(20)
+            .to_dict("records")
+        )
+
+        raise ValueError(
+            "Invalid RAIN_TIME_ID format was generated. "
+            f"Count: {invalid_format_count}. "
+            f"Examples: {examples}"
+        )
+
+    duplicate_rain_id_mask = (
+        filtered.duplicated(
+            subset=[
+                "SID",
+                "RAIN_TIME_ID",
+            ],
+            keep=False,
+        )
+    )
+
+    duplicate_rain_id_count = int(
+        duplicate_rain_id_mask.sum()
+    )
+
+    if duplicate_rain_id_count > 0:
+        examples = (
+            filtered.loc[
+                duplicate_rain_id_mask,
+                [
+                    "_INPUT_ROW_ID",
+                    "SID",
+                    "ISO_TIME",
+                    "RAIN_TIME_ID",
+                ],
+            ]
+            .sort_values(
+                [
+                    "SID",
+                    "RAIN_TIME_ID",
+                ]
+            )
+            .head(50)
+            .to_dict("records")
+        )
+
+        raise ValueError(
+            "Duplicate (SID, RAIN_TIME_ID) values were found. "
+            f"Count: {duplicate_rain_id_count}. "
+            f"Examples: {examples}"
+        )
+
+    reconstructed_time = (
+        rain_time_id_to_datetime(
+            filtered[
+                "RAIN_TIME_ID"
+            ]
+        )
+    )
+
+    mismatch_mask = (
+        reconstructed_time
+        != filtered["ISO_TIME"]
+    )
+
+    mismatch_count = int(
+        mismatch_mask.sum()
+    )
+
+    if mismatch_count > 0:
+        examples = (
+            filtered.loc[
+                mismatch_mask,
+                [
+                    "_INPUT_ROW_ID",
+                    "SID",
+                    "ISO_TIME",
+                    "RAIN_TIME_ID",
+                ],
+            ]
+            .assign(
+                RECONSTRUCTED_TIME=(
+                    reconstructed_time[
+                        mismatch_mask
+                    ].values
+                )
+            )
+            .head(20)
+            .to_dict("records")
+        )
+
+        raise ValueError(
+            "RAIN_TIME_ID round-trip validation failed. "
+            f"Count: {mismatch_count}. "
+            f"Examples: {examples}"
+        )
+
+    rain_time_id = filtered.pop(
+        "RAIN_TIME_ID"
+    )
+
+    iso_time_position = (
+        filtered.columns.get_loc(
+            "ISO_TIME"
+        )
+    )
+
+    filtered.insert(
+        iso_time_position + 1,
+        "RAIN_TIME_ID",
+        rain_time_id,
+    )
+
+    print(
+        "[PASS] RAIN_TIME_ID format validation passed."
+    )
+
+    print(
+        "[PASS] Every (SID, RAIN_TIME_ID) key is unique."
+    )
+
+    print(
+        "[PASS] RAIN_TIME_ID round-trip validation passed."
+    )
+
+    return filtered
+
+
+# ============================================================
+# 12. Calculate zonal and meridional translation velocities
+# ============================================================
+
+def wrapped_longitude_difference(lon_end, lon_start):
+    """Return the signed shortest longitude difference in degrees."""
+    return (
+        (lon_end - lon_start + 180.0)
+        % 360.0
+        - 180.0
+    )
+
+
+def calculate_translation_velocity_components(filtered):
+    """
+    Calculate TC translation-velocity components from USA_LAT and USA_LON.
+
+    Interior records use a centered difference between the previous and
+    following positions. The first and last records of each storm use forward
+    and backward differences, respectively. Eastward and northward motion are
+    positive. Actual elapsed time is used, so the calculation remains valid
+    when a storm track contains a missing 3-hourly record.
+    """
+    print("\n" + "=" * 80)
+    print("Step 6: Calculating translation-velocity components")
+    print("=" * 80)
+
+    result = filtered.sort_values(
+        ["SID", "ISO_TIME"],
+        kind="mergesort",
+    ).copy()
+
+    output_parts = []
+    for _, group in result.groupby("SID", sort=False):
+        group = group.copy()
+        count = len(group)
+
+        u_speed_kt = np.full(count, np.nan, dtype=float)
+        v_speed_kt = np.full(count, np.nan, dtype=float)
+
+        if count >= 2:
+            times = group["ISO_TIME"].to_numpy(dtype="datetime64[ns]")
+            latitudes = group["USA_LAT"].to_numpy(dtype=float)
+            longitudes = group["USA_LON"].to_numpy(dtype=float)
+
+            start_indices = np.arange(count, dtype=int) - 1
+            end_indices = np.arange(count, dtype=int) + 1
+            start_indices[0] = 0
+            end_indices[0] = 1
+            start_indices[-1] = count - 2
+            end_indices[-1] = count - 1
+
+            elapsed_hours = (
+                times[end_indices] - times[start_indices]
+            ) / np.timedelta64(1, "h")
+
+            valid_interval = (
+                np.isfinite(latitudes[start_indices])
+                & np.isfinite(latitudes[end_indices])
+                & np.isfinite(longitudes[start_indices])
+                & np.isfinite(longitudes[end_indices])
+                & np.isfinite(elapsed_hours)
+                & (elapsed_hours > 0.0)
+            )
+
+            delta_latitude = (
+                latitudes[end_indices] - latitudes[start_indices]
+            )
+            delta_longitude = wrapped_longitude_difference(
+                longitudes[end_indices],
+                longitudes[start_indices],
+            )
+            mean_latitude = 0.5 * (
+                latitudes[end_indices] + latitudes[start_indices]
+            )
+
+            u_speed_kt[valid_interval] = (
+                delta_longitude[valid_interval]
+                * NAUTICAL_MILES_PER_DEGREE
+                * np.cos(np.radians(mean_latitude[valid_interval]))
+                / elapsed_hours[valid_interval]
+            )
+            v_speed_kt[valid_interval] = (
+                delta_latitude[valid_interval]
+                * NAUTICAL_MILES_PER_DEGREE
+                / elapsed_hours[valid_interval]
+            )
+
+        group["u_speed_kt"] = u_speed_kt
+        group["v_speed_kt"] = v_speed_kt
+        group["calc_speed_kt"] = np.hypot(u_speed_kt, v_speed_kt)
+        group["calc_speed_ms"] = group["calc_speed_kt"] * KNOT_TO_MPS
+        group["u_speed_ms"] = u_speed_kt * KNOT_TO_MPS
+        group["v_speed_ms"] = v_speed_kt * KNOT_TO_MPS
+        output_parts.append(group)
+
+    result = pd.concat(output_parts, ignore_index=True)
+    if "_INPUT_ROW_ID" in result.columns:
+        result = result.sort_values(
+            "_INPUT_ROW_ID",
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+    velocity_columns = [
+        "u_speed_kt",
+        "v_speed_kt",
+        "calc_speed_kt",
+        "calc_speed_ms",
+        "u_speed_ms",
+        "v_speed_ms",
+    ]
+    rain_time_position = result.columns.get_loc("RAIN_TIME_ID")
+    velocity_data = result[velocity_columns].copy()
+    result = result.drop(columns=velocity_columns)
+    for offset, column in enumerate(velocity_columns, start=1):
+        result.insert(
+            rain_time_position + offset,
+            column,
+            velocity_data[column],
+        )
+
+    valid_count = int(result["calc_speed_kt"].notna().sum())
+    invalid_count = int(result["calc_speed_kt"].isna().sum())
+    print(f"Valid translation velocities: {valid_count}")
+    print(f"Unavailable translation velocities: {invalid_count}")
+    print("u_speed: eastward positive; westward negative")
+    print("v_speed: northward positive; southward negative")
+
+    return result
+
+
+# ============================================================
+# 13. Prepare final output
+# ============================================================
+
+def prepare_final_output(filtered):
+    """
+    Remove internal audit fields before saving the BASE table.
+    """
+    final_df = filtered.drop(
+        columns=[
+            "_INPUT_ROW_ID",
+        ],
+        errors="ignore",
+    ).copy()
+
+    return final_df
+
+
+# ============================================================
+# 14. Validate USA_RMW completeness in the BASE sample
+# ============================================================
+
+def safe_percentage(numerator, denominator):
+    """Return a percentage, or NaN when the denominator is zero."""
+    if denominator == 0:
+        return np.nan
+    return float(numerator) / float(denominator) * 100.0
+
+
+def validate_rmw_completeness(final_df):
+    """Audit record-level and exact-24-hour USA_RMW completeness."""
+    print("\n" + "=" * 80)
+    print("Step 8: Validating USA_RMW completeness")
+    print("=" * 80)
+
+    audit = final_df[
+        ["SID", "ISO_TIME", "USA_WIND", "USA_RMW"]
+    ].copy()
+    audit["YEAR"] = audit["ISO_TIME"].dt.year
+    audit["RMW_VALID"] = (
+        np.isfinite(audit["USA_RMW"])
+        & (audit["USA_RMW"] > 0.0)
+    )
+    audit["WIND_VALID"] = np.isfinite(audit["USA_WIND"])
+
+    record_rows = []
+    for start_year, end_year in RMW_CHECK_PERIODS:
+        subset = audit[
+            audit["YEAR"].between(start_year, end_year)
+        ]
+        wind_subset = subset[subset["WIND_VALID"]]
+        record_rows.append(
+            {
+                "PERIOD": f"{start_year}-{end_year}",
+                "TOTAL_RECORDS": len(subset),
+                "VALID_RMW_RECORDS": int(subset["RMW_VALID"].sum()),
+                "RMW_COMPLETENESS_PERCENT": safe_percentage(
+                    subset["RMW_VALID"].sum(), len(subset)
+                ),
+                "WIND_VALID_RECORDS": len(wind_subset),
+                "VALID_RMW_WITH_VALID_WIND": int(
+                    wind_subset["RMW_VALID"].sum()
+                ),
+                "RMW_COMPLETENESS_WITH_VALID_WIND_PERCENT": safe_percentage(
+                    wind_subset["RMW_VALID"].sum(), len(wind_subset)
+                ),
+            }
+        )
+    record_summary = pd.DataFrame(record_rows)
+
+    annual_summary = (
+        audit.groupby("YEAR", as_index=False)
+        .agg(
+            TOTAL_RECORDS=("SID", "size"),
+            VALID_RMW_RECORDS=("RMW_VALID", "sum"),
+            WIND_VALID_RECORDS=("WIND_VALID", "sum"),
+        )
+    )
+    annual_summary["RMW_COMPLETENESS_PERCENT"] = (
+        annual_summary["VALID_RMW_RECORDS"]
+        / annual_summary["TOTAL_RECORDS"]
+        * 100.0
+    )
+    annual_wind_rmw = (
+        audit[audit["WIND_VALID"]]
+        .groupby("YEAR")["RMW_VALID"]
+        .sum()
+    )
+    annual_summary["VALID_RMW_WITH_VALID_WIND"] = (
+        annual_summary["YEAR"].map(annual_wind_rmw).fillna(0).astype(int)
+    )
+    annual_summary["RMW_COMPLETENESS_WITH_VALID_WIND_PERCENT"] = (
+        annual_summary["VALID_RMW_WITH_VALID_WIND"]
+        / annual_summary["WIND_VALID_RECORDS"].replace(0, np.nan)
+        * 100.0
+    )
+
+    start = audit[
+        ["SID", "ISO_TIME", "YEAR", "USA_WIND", "RMW_VALID"]
+    ].rename(
+        columns={
+            "ISO_TIME": "ISO_TIME_S",
+            "USA_WIND": "USA_WIND_S",
+            "RMW_VALID": "RMW_VALID_S",
+        }
+    )
+    start["ISO_TIME_E"] = start["ISO_TIME_S"] + pd.Timedelta(hours=24)
+
+    end = audit[
+        ["SID", "ISO_TIME", "USA_WIND", "RMW_VALID"]
+    ].rename(
+        columns={
+            "ISO_TIME": "ISO_TIME_E",
+            "USA_WIND": "USA_WIND_E",
+            "RMW_VALID": "RMW_VALID_E",
+        }
+    )
+
+    windows = start.merge(
+        end,
+        on=["SID", "ISO_TIME_E"],
+        how="inner",
+        validate="one_to_one",
+    )
+    windows["BOTH_RMW_VALID"] = (
+        windows["RMW_VALID_S"] & windows["RMW_VALID_E"]
+    )
+    windows["DIFF_USA_WIND"] = (
+        windows["USA_WIND_E"] - windows["USA_WIND_S"]
+    )
+    windows["GROUP"] = "STEADY"
+    windows.loc[windows["DIFF_USA_WIND"] <= -30.0, "GROUP"] = "RW"
+    windows.loc[windows["DIFF_USA_WIND"] >= 30.0, "GROUP"] = "RI"
+
+    window_rows = []
+    for start_year, end_year in RMW_CHECK_PERIODS:
+        subset = windows[
+            windows["YEAR"].between(start_year, end_year)
+        ]
+        both_valid = int(subset["BOTH_RMW_VALID"].sum())
+        window_rows.append(
+            {
+                "PERIOD": f"{start_year}-{end_year}",
+                "EXACT_24H_WINDOWS": len(subset),
+                "BOTH_ENDPOINTS_RMW_VALID": both_valid,
+                "BOTH_ENDPOINT_COMPLETENESS_PERCENT": safe_percentage(
+                    both_valid, len(subset)
+                ),
+            }
+        )
+    window_summary = pd.DataFrame(window_rows)
+
+    group_summary = (
+        windows.groupby("GROUP", as_index=False)
+        .agg(
+            WINDOW_COUNT=("SID", "size"),
+            BOTH_ENDPOINTS_RMW_VALID=("BOTH_RMW_VALID", "sum"),
+        )
+    )
+    group_summary["BOTH_ENDPOINT_COMPLETENESS_PERCENT"] = (
+        group_summary["BOTH_ENDPOINTS_RMW_VALID"]
+        / group_summary["WINDOW_COUNT"]
+        * 100.0
+    )
+    group_order = {"RW": 0, "STEADY": 1, "RI": 2}
+    group_summary["_ORDER"] = group_summary["GROUP"].map(group_order)
+    group_summary = (
+        group_summary.sort_values("_ORDER")
+        .drop(columns="_ORDER")
+        .reset_index(drop=True)
+    )
+
+    write_csv_atomic(record_summary, RMW_RECORD_COMPLETENESS_CSV)
+    write_csv_atomic(annual_summary, RMW_ANNUAL_COMPLETENESS_CSV)
+    write_csv_atomic(window_summary, RMW_24H_COMPLETENESS_CSV)
+    write_csv_atomic(group_summary, RMW_24H_GROUP_COMPLETENESS_CSV)
+
+    print("\nRecord-level completeness:")
+    print(record_summary.to_string(index=False))
+    print("\nExact 24-hour endpoint completeness:")
+    print(window_summary.to_string(index=False))
+    print("\nExact 24-hour completeness by wind-change group:")
+    print(group_summary.to_string(index=False))
+    print(f"\nRecord summary: {RMW_RECORD_COMPLETENESS_CSV}")
+    print(f"Annual summary: {RMW_ANNUAL_COMPLETENESS_CSV}")
+    print(f"24-hour summary: {RMW_24H_COMPLETENESS_CSV}")
+    print(f"24-hour group summary: {RMW_24H_GROUP_COMPLETENESS_CSV}")
+
+
+# ============================================================
+# 15. Main program
+# ============================================================
+
+def main():
+    df = read_input_data()
+
+    original_rows = len(df)
+
+    df = parse_iso_time(
+        df
+    )
+
+    strict_3hour_mask = (
+        build_strict_3hour_mask(
+            df
+        )
+    )
+
+    audit_non_exact_times(
+        df,
+        strict_3hour_mask,
+    )
+
+    df = convert_numeric_columns(
+        df
+    )
+
+    (
+        filtered,
+        filter_summary,
+    ) = filter_records(
+        df,
+        strict_3hour_mask,
+    )
+
+    validate_unique_storm_times(
+        filtered
+    )
+
+    filtered = (
+        generate_and_validate_rain_time_id(
+            filtered
+        )
+    )
+
+    filtered = calculate_translation_velocity_components(
+        filtered
+    )
+
+    final_df = prepare_final_output(
+        filtered
+    )
+
+    print("\n" + "=" * 80)
+    print("Step 7: Saving the BASE table")
+    print("=" * 80)
+
+    write_csv_atomic(
+        final_df,
+        OUTPUT_CSV,
+        date_format="%Y-%m-%d %H:%M:%S",
+    )
+
+    validate_rmw_completeness(final_df)
+
+    final_rows = len(
+        final_df
+    )
+
+    removed_rows = (
+        original_rows
+        - final_rows
+    )
+
+    print("\n" + "=" * 80)
+    print("Processing summary")
+    print("=" * 80)
+
+    print(
+        f"Original rows: {original_rows}"
+    )
+
+    print(
+        f"Final retained rows: {final_rows}"
+    )
+
+    print(
+        f"Total removed rows: {removed_rows}"
+    )
+
+    if original_rows > 0:
+        print(
+            f"Retention rate: "
+            f"{final_rows / original_rows:.1%}"
+        )
+
+    print(
+        "Missing or invalid coordinate rows: "
+        f"{filter_summary['missing_coordinate_count']}"
+    )
+
+    print(
+        "Missing USA_SSHS or USA_SSHS < -1 rows: "
+        f"{filter_summary['invalid_sshs_count']}"
+    )
+
+    print(
+        "Non-exact 3-hourly rows in the input: "
+        f"{filter_summary['non_exact_time_count']}"
+    )
+
+    print(
+        "Rows removed only by the strict time filter: "
+        f"{filter_summary['time_only_removal_count']}"
+    )
+
+    print(
+        f"\nBASE table saved to: {OUTPUT_CSV}"
+    )
+
+    print(
+        "Non-exact-time audit saved to: "
+        f"{NON_EXACT_TIME_AUDIT_CSV}"
+    )
+
+    print("\nRAIN_TIME_ID examples:")
+
+    print(
+        final_df[
+            [
+                "SID",
+                "ISO_TIME",
+                "RAIN_TIME_ID",
+            ]
+        ]
+        .head(10)
+        .to_string(
+            index=False
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
