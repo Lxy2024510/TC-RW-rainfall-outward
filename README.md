@@ -15,8 +15,10 @@ The data and archived results are distributed separately through Zenodo:
 
 Download the following two archives from the Zenodo record:
 
-- `Data.rar` — input data required by the released calculation and plotting scripts;
+- `Data.rar` — a compact processed dataset containing the inputs required to run the released calculation and plotting scripts;
 - `Results.rar` — archived figures, tables, and quality-control outputs.
+
+The original source datasets are not redistributed because of their large size and/or licensing restrictions. The processed data provided through Zenodo are sufficient to reproduce the released analyses, figures, and tables.
 
 Place both archives in the root directory of this repository and extract them without changing their internal directory structure:
 
@@ -54,9 +56,9 @@ TC-RW-rainfall-outward/
 
 `Data/`, `Results/`, `Data.rar`, and `Results.rar` are intentionally excluded from Git because they are distributed through Zenodo.
 
-## 3. Software environment
+## 3. Software environment and installation
 
-The archived workflow was run with:
+The archived workflow was developed and tested on Ubuntu Linux with:
 
 - Python 3.9.21
 - pip 25.0
@@ -70,9 +72,13 @@ conda activate xin
 
 The main Python packages include NumPy, pandas, SciPy, xarray, netCDF4, h5netcdf, Matplotlib, GeoPandas, Shapely, pyproj, Cartopy, and tqdm. See `environment.yml` and `package_versions.txt` for the environment specification and package inventory.
 
-## 4. Reproducing the figures and tables
+Creating the Conda environment typically takes only a few minutes on a standard desktop computer with a stable internet connection.
 
-For most users, the recommended procedure is to download `Data.rar` from Zenodo and run only the scripts under `Plot_code/`. The computationally expensive raw-data extraction steps do not need to be repeated.
+No non-standard hardware is required to reproduce the figures and tables from the processed data provided through Zenodo. Reprocessing the complete original datasets may require substantially more disk space, memory, and computation time.
+
+## 4. Demo and reproduction of figures and tables
+
+For most users, the recommended procedure is to download `Data.rar` from Zenodo and run the scripts under `Plot_code/`. The computationally expensive raw-data extraction steps do not need to be repeated.
 
 Run all commands from the repository root:
 
@@ -88,7 +94,11 @@ python Plot_code/Main_figures/MAIN_FIG1C.py
 python Plot_code/Extended_tables/EXTENDED_DATA_TABLE1.py
 ```
 
-Generated figures and tables are written below `Results/`. The plotting scripts read from `Data/` and do not modify the archived input files.
+Successful execution generates the corresponding figures or tables under `Results/`. For example, `MAIN_FIG1AB.py` generates the outputs corresponding to Fig. 1A and Fig. 1B.
+
+Using the processed data provided through Zenodo, generation of an individual figure or table typically takes from several seconds to a few minutes on a standard desktop computer. This estimate refers only to generation of the final results from the processed data and does not include the substantially longer time required to repeat the complete workflow from the original source datasets.
+
+The plotting scripts read from `Data/` and do not modify the archived input files.
 
 ## 5. Reproducing the calculation workflow
 
@@ -118,7 +128,7 @@ The principal calculation modules include:
 - `Cal_code/ERA5/` — environmental variables and atmospheric diagnostics, including SST, RH, VWS, vertical motion, convergence, and radial mass flux;
 - `Cal_code/Exposure/` — population-exposure analysis.
 
-Some raw-data extraction steps require substantial disk space, memory, and processing time. The processed data supplied through Zenodo are sufficient for reproducing the published figures and tables.
+Some raw-data extraction steps require substantial disk space, memory, and processing time. The processed data supplied through Zenodo are sufficient for reproducing the released analyses, figures, and tables.
 
 ## 6. Project-root detection
 
@@ -146,7 +156,9 @@ The analyses use the following principal datasets:
 - GSHHG coastline data;
 - LandScan population data.
 
-Users who rerun the workflow from the original source data are responsible for obtaining those datasets from their official providers and complying with their respective licences and terms of use. The Zenodo archive contains the data released for reproducing the analyses, figures, and tables in this repository.
+Users who rerun the workflow from the original source data are responsible for obtaining those datasets from their official providers and complying with their respective licences and terms of use.
+
+The original source datasets are not redistributed through this repository because of their large size and/or licensing restrictions. The Zenodo archive contains the processed data released for reproducing the analyses, figures, and tables in this repository.
 
 ## 8. Reproducibility notes
 
@@ -168,7 +180,7 @@ The DOI link should be used instead of a direct file URL because it provides a p
 
 ## 10. License
 
-The original code in this repository is released under the [MIT License](LICENSE). Third-party datasets remain subject to the licences and terms of their respective providers.
+The original code developed for this study is released under the [MIT License](LICENSE). Third-party datasets remain subject to the licences and terms of use of their respective providers.
 
 ## 11. Contact
 
