@@ -1,0 +1,42 @@
+name: xin
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+
+  - numpy=1.26
+  - pandas=2.2
+  - scipy=1.13
+  - matplotlib=3.9
+  - xarray=2023.7
+
+  - netcdf4
+  - h5netcdf
+  - h5py
+
+  - rasterio
+  - geopandas
+  - cartopy
+  - pyproj
+  - shapely
+  - fiona
+  - gdal
+
+  - dask
+  - distributed
+  - statsmodels
+  - seaborn
+
+  - openpyxl
+  - geopy
+  - ipykernel
+  - pip
+
+  - pip:
+      - cdsapi==0.7.5
+      - pymannkendall==1.4.3
+      - scikit-posthocs==0.11.4
+      - rioxarray==0.15.0
